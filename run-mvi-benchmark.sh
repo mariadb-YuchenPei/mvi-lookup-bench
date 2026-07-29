@@ -2,7 +2,7 @@
 
 if [[ "$1" == "mysql" ]]; then
   
-  SERVER=mariadb
+  SERVER=mysql
   SYSBENCH_COMMON_ARGS=(
     --mysql-host=127.0.0.1
     --mysql-port=3312
@@ -14,7 +14,7 @@ if [[ "$1" == "mysql" ]]; then
 
 elif [[ "$1" == "mariadb_ft_json" ]]; then
 
-  SERVER=mysql
+  SERVER=mariadb
   SYSBENCH_COMMON_ARGS=(
     --mysql-host=127.0.0.1
     --mysql-port=3319
@@ -33,7 +33,7 @@ fi
 TABLE_SIZES=(10000 50000 100000 500000 1000000)
 TEST_NAME=mvi_test.lua
 
-RESULT_NAME=res3
+RESULT_NAME=res4
 THREADS=32
 
 LOG_FILE="$RESULT_NAME-$SERVER-thr-$THREADS"
