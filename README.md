@@ -6,7 +6,7 @@ It tests
 * MySQL: Multi-Value Index
 * MariaDB: Emulation of multi-value index through Fulltext.
 
-Usage:  
+Usage:
 ```
   run-mvi-benchmark.sh  (mysql|mariadb_ft_json)
 ```

@@ -57,21 +57,21 @@ function cmd_prepare()
         )
     ]]
 
-    if index_type == "ft_json" then 
+    if index_type == "ft_json" then
         con:query(create_table_ft_json)
     else
         con:query(create_table_array)
     end
 
     print(string.format("Inserting %d rows (using batches of 1000)...", sysbench.opt.table_size))
-    
+
     -- Batch inserts for faster data population
     local batch_size = 1000
     for i = 1, sysbench.opt.table_size, batch_size do
         local query = "INSERT INTO mvi_benchmark (attributes, attr1) VALUES "
         local values = {}
         local end_idx = math.min(i + batch_size - 1, sysbench.opt.table_size)
-        
+
         for j = i, end_idx do
             -- Generate a JSON array with 1 or 2 random tags (50/50), each of the
             -- form "value-N" with N between 1 and table_size. attr1 duplicates
@@ -88,7 +88,7 @@ function cmd_prepare()
                                   t1, t2, t1))
             end
         end
-        
+
         query = query .. table.concat(values, ", ")
         con:query(query)
     end
@@ -99,7 +99,7 @@ end
 function cmd_cleanup()
     local drv = sysbench.sql.driver()
     local con = drv:connect()
-    
+
     print("Cleaning up table mvi_benchmark...")
     con:query("DROP TABLE IF EXISTS mvi_benchmark")
     con:disconnect()

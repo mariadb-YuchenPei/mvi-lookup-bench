@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 if [[ "$1" == "mysql" ]]; then
-  
+
   SERVER=mysql
   SYSBENCH_COMMON_ARGS=(
     --mysql-host=127.0.0.1
@@ -48,8 +48,8 @@ for SIZE in "${TABLE_SIZES[@]}"; do
   # 1. Cleanup old data & Prepare new test table
   sysbench $TEST_NAME "${SYSBENCH_COMMON_ARGS[@]}" cleanup
   sysbench $TEST_NAME "${SYSBENCH_COMMON_ARGS[@]}" --table-size=$SIZE prepare
-  
-  for QUERY_TYPE in attr1 member ; do 
+
+  for QUERY_TYPE in attr1 member ; do
 
     sysbench \
         $TEST_NAME "${SYSBENCH_COMMON_ARGS[@]}" \
@@ -64,7 +64,7 @@ for SIZE in "${TABLE_SIZES[@]}"; do
     #QPS=$(echo "$OUTPUT" | awk -F'(' '/queries:/ {print $2}' | awk '{print $1}')
 
     echo "Result($QUERY_TYPE) -> Table Size: $SIZE | TPS: $TPS | QPS: $QPS"
-  
+
     # 2.3. Append to CSV
     echo "$SIZE,$TPS" >> $LOG_FILE-$QUERY_TYPE.csv
 
@@ -72,4 +72,3 @@ for SIZE in "${TABLE_SIZES[@]}"; do
 done
 
 sysbench $TEST_NAME "${SYSBENCH_COMMON_ARGS[@]}" cleanup
-
