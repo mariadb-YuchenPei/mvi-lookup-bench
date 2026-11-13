@@ -28,9 +28,8 @@ elif [[ "$1" == "mariadb" ]]; then
 
   SERVER=mariadb_mvi
   SYSBENCH_COMMON_ARGS=(
-    --mysql-host=127.0.0.1
-    --mysql-port=3319
-    --mysql-user=root
+    --mysql-socket=/tmp/build.sock
+    --mysql-user=$USER
     --mysql-db=test
     --rand-type=uniform
     --index-type=mariadb_array
