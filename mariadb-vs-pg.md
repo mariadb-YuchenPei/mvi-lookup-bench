@@ -29,24 +29,47 @@ the point of the runs is to confirm or refute them.
 These are the reasons behind the workload choice: each workload below tests
 one or more of them. All follow from the table above; none is measured yet.
 
-| #   | Hypothesis                                                                                     | Expected better | Reason                                                                                                   | Tested by        |
-|-----|------------------------------------------------------------------------------------------------|-----------------|----------------------------------------------------------------------------------------------------------|------------------|
-| H1  | Selective single-value lookups are at least as fast on MariaDB                                 | MariaDB         | one B-tree probe and a PK fetch; PostgreSQL builds a bitmap and rechecks every match                       | R1               |
-| H2  | Lookups matching many rows are faster on PostgreSQL, and the gap grows with the number of matches | PostgreSQL      | PostgreSQL reads matching rows in physical order; MariaDB does one random `rnd_pos()` per row            | R2, R7, R8       |
-| H3  | AND of values that are each common but rare together is faster on PostgreSQL                  | PostgreSQL      | PostgreSQL intersects posting lists; MariaDB reads all rows of the cheaper value and rechecks each        | R3               |
-| H4  | OR of a few values is close; with many values PostgreSQL pulls ahead                           | PostgreSQL      | both union the values; PostgreSQL's bitmaps scale better, MariaDB's estimate is capped by the dive limit  | R4               |
-| H5  | MariaDB picks the right index more often when the array condition is combined with others      | MariaDB         | real counts from `records_in_range()` dives vs PostgreSQL's fixed `@>` selectivity                        | R5, R8           |
-| H6  | Using the array index together with another index is faster on PostgreSQL                     | PostgreSQL      | BitmapAnd across indexes; MariaDB has only index_merge `sort_union` for the ARRAY key                     | R5               |
-| H7  | Joins on membership are much faster on PostgreSQL                                              | PostgreSQL      | parameterized bitmap scans per outer row; MariaDB has no `ref` access through the ARRAY key               | R6               |
-| H8  | Long string values cost MariaDB little; PostgreSQL rechecks more                               | MariaDB (small) | MariaDB keeps values up to 16 bytes exactly and hashes longer ones; `jsonb_path_ops` hashes all to 32 bits | R1 on `strings`  |
-| H9  | Inserts are faster on PostgreSQL on average, with periodic stalls; MariaDB is slower but steady | PostgreSQL (mean), MariaDB (tail) | PostgreSQL's pending list defers index work until a merge; MariaDB writes side-table rows in the statement | W1, W3, M2 |
-| H10 | Building the index on a loaded table is faster on PostgreSQL                                   | PostgreSQL      | PostgreSQL builds GIN from sorted keys; MariaDB fills the side table row by row                           | W2               |
-| H11 | Updating or deleting the array costs both about the same per element, but PostgreSQL pays later | similar         | MariaDB deletes and inserts entries at once; PostgreSQL adds new entries and leaves old ones for vacuum   | W4, W6, W7, M3   |
-| H12 | Updating another column doesn't touch the array index on either                                | similar         | MariaDB skips the side table (`update_needed`); PostgreSQL can do a HOT update                            | W5               |
-| H13 | Write cost grows with array length at a similar rate                                           | similar         | one index entry per element on both                                                                       | W8               |
-| H14 | Read latency under concurrent writes is steadier on MariaDB                                    | MariaDB         | PostgreSQL reads scan the pending list until it's merged                                                 | M2               |
-| H15 | The PostgreSQL index is smaller, more so with skewed data                                      | PostgreSQL      | posting lists store each key once; MariaDB stores one B-tree row per element, including the row reference | Space            |
-| H16 | Results are identical, except numbers near zero on MariaDB                                     | -               | MariaDB compares double bits but `val_bool` allows a 1e-12 tolerance (finding #6)                         | R9, Correctness  |
+| #   | Hypothesis                                                                                     | Expected better | Reason                                                                                                   | Tested by        | Priority |
+|-----|------------------------------------------------------------------------------------------------|-----------------|----------------------------------------------------------------------------------------------------------|------------------|----------|
+| H1  | Selective single-value lookups are at least as fast on MariaDB                                 | MariaDB         | one B-tree probe and a PK fetch; PostgreSQL builds a bitmap and rechecks every match                       | R1               | 3        |
+| H2  | Lookups matching many rows are faster on PostgreSQL, and the gap grows with the number of matches | PostgreSQL      | PostgreSQL reads matching rows in physical order; MariaDB does one random `rnd_pos()` per row            | R2, R7, R8       | 2        |
+| H3  | AND of values that are each common but rare together is faster on PostgreSQL                  | PostgreSQL      | PostgreSQL intersects posting lists; MariaDB reads all rows of the cheaper value and rechecks each        | R3               | 1        |
+| H4  | OR of a few values is close; with many values PostgreSQL pulls ahead                           | PostgreSQL      | both union the values; PostgreSQL's bitmaps scale better, MariaDB's estimate is capped by the dive limit  | R4               | 3        |
+| H5  | MariaDB picks the right index more often when the array condition is combined with others      | MariaDB         | real counts from `records_in_range()` dives vs PostgreSQL's fixed `@>` selectivity                        | R5, R8           | 1        |
+| H6  | Using the array index together with another index is faster on PostgreSQL                     | PostgreSQL      | BitmapAnd across indexes; MariaDB has only index_merge `sort_union` for the ARRAY key                     | R5               | 1        |
+| H7  | Joins on membership are much faster on PostgreSQL                                              | PostgreSQL      | parameterized bitmap scans per outer row; MariaDB has no `ref` access through the ARRAY key               | R6               | 1        |
+| H8  | Long string values cost MariaDB little; PostgreSQL rechecks more                               | MariaDB (small) | MariaDB keeps values up to 16 bytes exactly and hashes longer ones; `jsonb_path_ops` hashes all to 32 bits | R1 on `strings`  | 3        |
+| H9  | Inserts are faster on PostgreSQL on average, with periodic stalls; MariaDB is slower but steady | PostgreSQL (mean), MariaDB (tail) | PostgreSQL's pending list defers index work until a merge; MariaDB writes side-table rows in the statement | W1, W3, M2 | 2        |
+| H10 | Building the index on a loaded table is faster on PostgreSQL                                   | PostgreSQL      | PostgreSQL builds GIN from sorted keys; MariaDB fills the side table row by row                           | W2               | 2        |
+| H11 | Updating or deleting the array costs both about the same per element, but PostgreSQL pays later | similar         | MariaDB deletes and inserts entries at once; PostgreSQL adds new entries and leaves old ones for vacuum   | W4, W6, W7, M3   | 3        |
+| H12 | Updating another column doesn't touch the array index on either                                | similar         | MariaDB skips the side table (`update_needed`); PostgreSQL can do a HOT update                            | W5               | 3        |
+| H13 | Write cost grows with array length at a similar rate                                           | similar         | one index entry per element on both                                                                       | W8               | 3        |
+| H14 | Read latency under concurrent writes is steadier on MariaDB                                    | MariaDB         | PostgreSQL reads scan the pending list until it's merged                                                 | M2               | 2        |
+| H15 | The PostgreSQL index is smaller, more so with skewed data                                      | PostgreSQL      | posting lists store each key once; MariaDB stores one B-tree row per element, including the row reference | Space            | 2        |
+| H16 | Results are identical, except numbers near zero on MariaDB                                     | -               | MariaDB compares double bits but `val_bool` allows a 1e-12 tolerance (finding #6)                         | R9, Correctness  | gate     |
+
+Priority is the expected size of the difference between the two systems:
+
+- **1**: an order of magnitude or more, growing with data size (H3, H5,
+  H6, H7).
+- **2**: several times, or mainly in tail latency (H2, H9, H10, H14, H15).
+- **3**: expected close; run once as a baseline (H1, H4, H8, H11-H13).
+- **gate**: H16 is checked with every run; a result only counts if the
+  matched rows agree.
+
+## First runs
+
+In order, all on the `skewed` data set (the only one with common values,
+which R2, R3 and R5 need) and with the correctness checks:
+
+1. R6, join on membership (H7).
+2. R3, AND of two common values that are rare together (H3).
+3. R5, combined with an indexed range on another column (H5, H6).
+4. R2 and R7, common values (H2).
+5. W3 and M2, with latency percentiles (H9, H14).
+
+R1 (H1) is already covered by the current `mvi_test.lua`; the rest
+follows by priority.
 
 ## Systems and setup
 
