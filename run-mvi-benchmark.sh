@@ -50,7 +50,7 @@ elif [[ "$1" == "pg" ]]; then
   )
 
 else
-  echo "Need argument: mysql, mariadb_ft_json, mariadb or pg"
+  echo "Usage: $0 (mysql|mariadb_ft_json|mariadb|pg) [THREADS] [CPUS]"
   exit 1
 fi
 
@@ -59,7 +59,16 @@ TABLE_SIZES=(10000 50000 100000 500000 1000000)
 TEST_NAME=mvi_test.lua
 
 RESULT_NAME=res4
-THREADS=32
+# Number of sysbench client threads (default 32)
+THREADS=${2:-32}
+
+# CPU list for the sysbench client during the run, in taskset -c format
+# (e.g. 8-15). Default: no pinning. Pin the server separately.
+CPUS=${3:-}
+PIN=()
+if [[ -n "$CPUS" ]]; then
+  PIN=(taskset -c "$CPUS")
+fi
 
 LOG_FILE="$RESULT_NAME-$SERVER-thr-$THREADS"
 
@@ -82,7 +91,7 @@ for SIZE in "${TABLE_SIZES[@]}"; do
 	explain
 
     # 2. Run workload and capture output
-    OUTPUT=$(sysbench $TEST_NAME "${SYSBENCH_COMMON_ARGS[@]}" --query-type=$QUERY_TYPE --table-size=$SIZE --time=30 --threads=$THREADS run)
+    OUTPUT=$("${PIN[@]}" sysbench $TEST_NAME "${SYSBENCH_COMMON_ARGS[@]}" --query-type=$QUERY_TYPE --table-size=$SIZE --time=30 --threads=$THREADS run)
 
     # 2.1. Parse TPS and QPS from output
     TPS=$(echo "$OUTPUT" | awk -F'(' '/transactions:/ {print $2}' | awk '{print $1}')
