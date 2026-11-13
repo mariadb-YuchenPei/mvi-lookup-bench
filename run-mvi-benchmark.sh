@@ -24,8 +24,20 @@ elif [[ "$1" == "mariadb_ft_json" ]]; then
     --index-type=ft_json
   )
 
+elif [[ "$1" == "mariadb" ]]; then
+
+  SERVER=mariadb_mvi
+  SYSBENCH_COMMON_ARGS=(
+    --mysql-host=127.0.0.1
+    --mysql-port=3319
+    --mysql-user=root
+    --mysql-db=test
+    --rand-type=uniform
+    --index-type=mariadb_array
+  )
+
 else
-  echo "Need argument: mysql or mariadb_ft_json"
+  echo "Need argument: mysql, mariadb_ft_json or mariadb"
   exit 1
 fi
 

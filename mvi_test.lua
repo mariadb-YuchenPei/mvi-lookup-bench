@@ -1,7 +1,7 @@
 -- mvi_test.lua
 sysbench.cmdline.options = {
     table_size = {"Number of rows in the table", 1000000},
-    index_type = {"Index to use: ft_json or array"},
+    index_type = {"Index to use: ft_json, array or mariadb_array"},
     query_type = {"Lookup to benchmark: member (multi-valued index) or " ..
                   "attr1 (plain index on the first tag)", "member"}
 }
@@ -57,8 +57,22 @@ function cmd_prepare()
         )
     ]]
 
+    -- MariaDB's multi-valued index only uses the index when the column is
+    -- the MEMBER OF argument, so attributes holds the tags array itself.
+    local create_table_mariadb_array = [[
+        CREATE TABLE mvi_benchmark (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            attributes JSON,
+            attr1 VARCHAR(32),
+            INDEX idx_attributes (CAST(attributes AS CHAR(32) ARRAY)),
+            INDEX idx_attr1 (attr1)
+        )
+    ]]
+
     if index_type == "ft_json" then
         con:query(create_table_ft_json)
+    elseif index_type == "mariadb_array" then
+        con:query(create_table_mariadb_array)
     else
         con:query(create_table_array)
     end
@@ -78,7 +92,18 @@ function cmd_prepare()
             -- the first array element as a plain indexed column, so the same
             -- lookup can be benchmarked with and without the multi-valued index.
             local t1 = sysbench.rand.default(1, sysbench.opt.table_size)
-            if sysbench.rand.uniform(1, 2) == 1 then
+            if index_type == "mariadb_array" then
+                -- attributes is the tags array itself, see above
+                if sysbench.rand.uniform(1, 2) == 1 then
+                    table.insert(values,
+                        string.format("('[\"value-%d\"]', 'value-%d')", t1, t1))
+                else
+                    local t2 = sysbench.rand.default(1, sysbench.opt.table_size)
+                    table.insert(values,
+                        string.format("('[\"value-%d\", \"value-%d\"]', 'value-%d')",
+                                      t1, t2, t1))
+                end
+            elseif sysbench.rand.uniform(1, 2) == 1 then
                 table.insert(values,
                     string.format("('{\"tags\": [\"value-%d\"]}', 'value-%d')", t1, t1))
             else
@@ -115,6 +140,11 @@ local sql_for = {
             "SELECT id FROM mvi_benchmark WHERE MATCH(attributes) AGAINST ('tags.0=value-%d' IN BOOLEAN MODE)", tag)
     end,
 
+    member_mariadb_array = function(tag)
+        return string.format(
+            "SELECT id FROM mvi_benchmark WHERE 'value-%d' MEMBER OF(attributes)", tag)
+    end,
+
     member_array = function(tag)
         return string.format(
             "SELECT id FROM mvi_benchmark WHERE 'value-%d' MEMBER OF(attributes->'$.tags')", tag)
@@ -131,7 +161,8 @@ local sql_for = {
 -- thread_init() and the explain command.
 local function resolve_query()
     local index_type = sysbench.opt.index_type
-    if (index_type ~= "ft_json" and index_type ~= "array") then
+    if (index_type ~= "ft_json" and index_type ~= "array" and
+        index_type ~= "mariadb_array") then
        error("The argument --index-type must be set")
     end
 
@@ -139,6 +170,8 @@ local function resolve_query()
     if query_type == "member" then
       if index_type == "ft_json" then
         query_type = "member_ft_json"
+      elseif index_type == "mariadb_array" then
+        query_type = "member_mariadb_array"
       else
         query_type = "member_array"
       end
