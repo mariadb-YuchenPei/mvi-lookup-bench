@@ -71,10 +71,37 @@ which R2, R3 and R5 need) and with the correctness checks:
 R1 (H1) is already covered by the current `mvi_test.lua`; the rest
 follows by priority.
 
+## Comparison with the original MDEV-25848 commit
+
+The original MDEV-25848 commit, 30b17912 (the head of PR 5841), differs from
+a218d24a in the range optimizer only:
+
+| Workload            | At 30b17912                                                                                                   | At a218d24a                                          |
+|---------------------|---------------------------------------------------------------------------------------------------------------|------------------------------------------------------|
+| R3 (AND of values)  | JSON_CONTAINS has no range support (full scan). ANDed MEMBER OF: one cloned key part per value, one used plus a recheck | JSON_CONTAINS and ANDed MEMBER OF: the cheapest value plus a recheck |
+| R4 (OR of values)   | JSON_OVERLAPS has no range support. ORed MEMBER OF: index_merge `sort_union` over cloned key parts, and no range once the clones exceed `MAX_KEY` (after a handful of values) | one range over the union of all values, no limit      |
+| All other workloads | same as a218d24a                                                                                              |                                                      |
+
+To show what the change from 30b17912 to a218d24a gives, run R3 and R4 on
+both commits, written with MEMBER OF (`v1 MEMBER OF (attributes) AND/OR
+v2 MEMBER OF (attributes) ...`) so that 30b17912 gets a range at all:
+
+- R4 with 2, 5, 10 and 20 values. Expectation: on 30b17912 the plan falls
+  back to a full scan beyond a few values; on a218d24a it stays one range
+  scan.
+- R3 with 2 values, also with `optimizer_switch='index_merge_sort_intersection=on'`
+  on 30b17912. The separate cloned key parts there might allow an index
+  intersection, which a218d24a's single key slot can't; not verified.
+
+Against PostgreSQL, 30b17912 makes R4 a priority 1 workload: a full scan
+compared with a bitmap OR.
+
 ## Systems and setup
 
-- **MariaDB**: a build with MDEV-25848 (`bb-main-todo-6385`), InnoDB.
-  Table layout: `attributes JSON` holding the bare tags array,
+- **MariaDB**: a build of `bb-main-todo-6385` at a218d24a ("MDEV-25848 one
+  range slot per ARRAY index") or later, InnoDB. Later commits on that
+  branch (bounding the range optimizer work) only change planning time for
+  large JSON constants, not the planned workloads. Table layout: `attributes JSON` holding the bare tags array,
   `INDEX (CAST(attributes AS CHAR(32) ARRAY))`.
 - **PostgreSQL**: a current release. Two index variants, run separately:
   - `pg`: `GIN ((attributes->'tags') jsonb_path_ops)` on `{"tags": [...]}`,
