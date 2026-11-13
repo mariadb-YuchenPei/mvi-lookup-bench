@@ -4,9 +4,9 @@ Draft, 2026-11-13.
 
 This document plans benchmark runs comparing MariaDB's multi-valued index
 (MVI, MDEV-25848) with PostgreSQL's GIN index on JSONB, for reads and for
-writes. The current `mvi_test.lua` covers only R1 below. Every
-"Expectation" here is a hypothesis from how the two indexes are built; the
-point of the runs is to confirm or refute it.
+writes. The current `mvi_test.lua` covers only R1 below. Every expectation
+here is a hypothesis from how the two indexes are built (see "Hypotheses");
+the point of the runs is to confirm or refute them.
 
 ## How the two indexes differ
 
@@ -23,6 +23,30 @@ point of the runs is to confirm or refute it.
 | Estimates           | `records_in_range()` dives, real counts                             | fixed selectivity for `@>`; weak jsonb statistics                         |
 | Writes              | side-table rows inserted/deleted in the statement                   | direct insert, or a pending list (`fastupdate`) merged later              |
 | Indexes per table   | one hlindex                                                        | any number                                                                |
+
+## Hypotheses
+
+These are the reasons behind the workload choice: each workload below tests
+one or more of them. All follow from the table above; none is measured yet.
+
+| #   | Hypothesis                                                                                     | Expected better | Reason                                                                                                   | Tested by        |
+|-----|------------------------------------------------------------------------------------------------|-----------------|----------------------------------------------------------------------------------------------------------|------------------|
+| H1  | Selective single-value lookups are at least as fast on MariaDB                                 | MariaDB         | one B-tree probe and a PK fetch; PostgreSQL builds a bitmap and rechecks every match                       | R1               |
+| H2  | Lookups matching many rows are faster on PostgreSQL, and the gap grows with the number of matches | PostgreSQL      | PostgreSQL reads matching rows in physical order; MariaDB does one random `rnd_pos()` per row            | R2, R7, R8       |
+| H3  | AND of values that are each common but rare together is faster on PostgreSQL                  | PostgreSQL      | PostgreSQL intersects posting lists; MariaDB reads all rows of the cheaper value and rechecks each        | R3               |
+| H4  | OR of a few values is close; with many values PostgreSQL pulls ahead                           | PostgreSQL      | both union the values; PostgreSQL's bitmaps scale better, MariaDB's estimate is capped by the dive limit  | R4               |
+| H5  | MariaDB picks the right index more often when the array condition is combined with others      | MariaDB         | real counts from `records_in_range()` dives vs PostgreSQL's fixed `@>` selectivity                        | R5, R8           |
+| H6  | Using the array index together with another index is faster on PostgreSQL                     | PostgreSQL      | BitmapAnd across indexes; MariaDB has only index_merge `sort_union` for the ARRAY key                     | R5               |
+| H7  | Joins on membership are much faster on PostgreSQL                                              | PostgreSQL      | parameterized bitmap scans per outer row; MariaDB has no `ref` access through the ARRAY key               | R6               |
+| H8  | Long string values cost MariaDB little; PostgreSQL rechecks more                               | MariaDB (small) | MariaDB keeps values up to 16 bytes exactly and hashes longer ones; `jsonb_path_ops` hashes all to 32 bits | R1 on `strings`  |
+| H9  | Inserts are faster on PostgreSQL on average, with periodic stalls; MariaDB is slower but steady | PostgreSQL (mean), MariaDB (tail) | PostgreSQL's pending list defers index work until a merge; MariaDB writes side-table rows in the statement | W1, W3, M2 |
+| H10 | Building the index on a loaded table is faster on PostgreSQL                                   | PostgreSQL      | PostgreSQL builds GIN from sorted keys; MariaDB fills the side table row by row                           | W2               |
+| H11 | Updating or deleting the array costs both about the same per element, but PostgreSQL pays later | similar         | MariaDB deletes and inserts entries at once; PostgreSQL adds new entries and leaves old ones for vacuum   | W4, W6, W7, M3   |
+| H12 | Updating another column doesn't touch the array index on either                                | similar         | MariaDB skips the side table (`update_needed`); PostgreSQL can do a HOT update                            | W5               |
+| H13 | Write cost grows with array length at a similar rate                                           | similar         | one index entry per element on both                                                                       | W8               |
+| H14 | Read latency under concurrent writes is steadier on MariaDB                                    | MariaDB         | PostgreSQL reads scan the pending list until it's merged                                                 | M2               |
+| H15 | The PostgreSQL index is smaller, more so with skewed data                                      | PostgreSQL      | posting lists store each key once; MariaDB stores one B-tree row per element, including the row reference | Space            |
+| H16 | Results are identical, except numbers near zero on MariaDB                                     | -               | MariaDB compares double bits but `val_bool` allows a 1e-12 tolerance (finding #6)                         | R9, Correctness  |
 
 ## Systems and setup
 
@@ -65,17 +89,19 @@ data.
 
 ## Read workloads
 
+The last column restates the relevant hypotheses for each workload.
+
 | #  | Workload                          | MariaDB                                                          | PostgreSQL (`pg`)                                          | Expectation and reasoning |
 |----|-----------------------------------|------------------------------------------------------------------|------------------------------------------------------------|---------------------------|
-| R1 | Selective single value (current)  | `'v' MEMBER OF (attributes)`                                     | `attributes->'tags' @> '["v"]'`                            | Comparable, MariaDB possibly faster: one B-tree probe and a PK fetch, no bitmap, no recheck. |
-| R2 | Common value                      | as R1, `skewed`, top-10 values                                   | as R1                                                      | PostgreSQL faster: it reads rows in physical order; MariaDB does one random `rnd_pos()` per row. Gap grows with matches. |
-| R3 | AND of values, rare together      | `JSON_CONTAINS(attributes, '["a","b"]')`                         | `attributes->'tags' @> '["a","b"]'`                        | PostgreSQL faster: it intersects posting lists; MariaDB scans the cheaper value's rows and rechecks each. |
-| R4 | OR of many values                 | `JSON_OVERLAPS(attributes, '[...20 values...]')`                 | OR of `@>`, or `?|` with `jsonb_ops`                        | Close for small lists; with many values MariaDB's estimate is capped by `eq_range_index_dive_limit`, PostgreSQL ORs bitmaps. |
-| R5 | Combined with another column      | `... AND created BETWEEN ...`                                    | same                                                       | Plan choice: MariaDB's real counts should pick the right index more often; PostgreSQL can combine both with BitmapAnd. Measure plan and time. |
-| R6 | Join on membership                | `SELECT ... FROM vals JOIN t ON vals.v MEMBER OF (t.attributes)` | `... ON t.attributes->'tags' @> jsonb_build_array(vals.v)` | PostgreSQL faster: parameterized bitmap scans; MariaDB has no `ref` access through the ARRAY key. |
-| R7 | `COUNT(*)` of matches             | `SELECT COUNT(*) ... WHERE <R1/R2>`                              | same                                                       | Neither can count from the index alone; same pattern as R1/R2. |
-| R8 | `LIMIT` with `ORDER BY id`        | `... WHERE <R2> ORDER BY id LIMIT 10`                            | same                                                       | Both must read all matches, or scan by PK and filter. Shows which planner picks better. |
-| R9 | Number equality                   | `5 MEMBER OF (attributes)`, `numbers`                            | `@> '[5]'`                                                 | Speed similar; check results match. MariaDB misses `-0` and near-zero values (finding #6). |
+| R1 | Selective single value (current)  | `'v' MEMBER OF (attributes)`                                     | `attributes->'tags' @> '["v"]'`                            | H1, H8: Comparable, MariaDB possibly faster: one B-tree probe and a PK fetch, no bitmap, no recheck. |
+| R2 | Common value                      | as R1, `skewed`, top-10 values                                   | as R1                                                      | H2: PostgreSQL faster: it reads rows in physical order; MariaDB does one random `rnd_pos()` per row. Gap grows with matches. |
+| R3 | AND of values, rare together      | `JSON_CONTAINS(attributes, '["a","b"]')`                         | `attributes->'tags' @> '["a","b"]'`                        | H3: PostgreSQL faster: it intersects posting lists; MariaDB scans the cheaper value's rows and rechecks each. |
+| R4 | OR of many values                 | `JSON_OVERLAPS(attributes, '[...20 values...]')`                 | OR of `@>`, or `?|` with `jsonb_ops`                        | H4: Close for small lists; with many values MariaDB's estimate is capped by `eq_range_index_dive_limit`, PostgreSQL ORs bitmaps. |
+| R5 | Combined with another column      | `... AND created BETWEEN ...`                                    | same                                                       | H5, H6: Plan choice: MariaDB's real counts should pick the right index more often; PostgreSQL can combine both with BitmapAnd. Measure plan and time. |
+| R6 | Join on membership                | `SELECT ... FROM vals JOIN t ON vals.v MEMBER OF (t.attributes)` | `... ON t.attributes->'tags' @> jsonb_build_array(vals.v)` | H7: PostgreSQL faster: parameterized bitmap scans; MariaDB has no `ref` access through the ARRAY key. |
+| R7 | `COUNT(*)` of matches             | `SELECT COUNT(*) ... WHERE <R1/R2>`                              | same                                                       | H2: Neither can count from the index alone; same pattern as R1/R2. |
+| R8 | `LIMIT` with `ORDER BY id`        | `... WHERE <R2> ORDER BY id LIMIT 10`                            | same                                                       | H2, H5: Both must read all matches, or scan by PK and filter. Shows which planner picks better. |
+| R9 | Number equality                   | `5 MEMBER OF (attributes)`, `numbers`                            | `@> '[5]'`                                                 | H16: Speed similar; check results match. MariaDB misses `-0` and near-zero values (finding #6). |
 
 R1-R9 also run with `pg_array` (`tags @> ARRAY['v']`, `tags && ARRAY[...]`).
 
@@ -83,22 +109,22 @@ R1-R9 also run with `pg_array` (`tags @> ARRAY['v']`, `tags && ARRAY[...]`).
 
 | #  | Workload                              | Statement (MariaDB / PostgreSQL)                                                     | Expectation and reasoning |
 |----|---------------------------------------|---------------------------------------------------------------------------------------|---------------------------|
-| W1 | Bulk load, index present              | multi-row `INSERT` of all rows (as `prepare`)                                         | PostgreSQL with `fastupdate` faster per row; MariaDB writes one side-table row per element during the statement. Report rows/s. |
-| W2 | Index build on loaded table           | `ALTER TABLE ... ADD INDEX` / `CREATE INDEX`                                          | Measures bulk index creation; PostgreSQL sorts keys; MariaDB fills the side table row by row. |
-| W3 | Single-row inserts, concurrent        | `INSERT ... VALUES (...)`                                                             | PostgreSQL faster until the pending list is merged, then periodic stalls. Report latency percentiles, not only TPS. |
-| W4 | Update the array                      | `UPDATE t SET attributes = ... WHERE id = ?` (replace 1 of the tags)                  | MariaDB: delete and insert all of the row's entries. PostgreSQL: a new row version with all its GIN entries, old ones left for vacuum. |
-| W5 | Update another column                 | `UPDATE t SET payload = ... WHERE id = ?`                                             | MariaDB should skip the side table (`update_needed`); PostgreSQL may use a HOT update if no indexed column changes. Both should be cheap; checks that neither touches the array index. |
-| W6 | Delete                                | `DELETE FROM t WHERE id = ?`                                                          | MariaDB deletes the entries at once; PostgreSQL leaves them for vacuum. |
-| W7 | Upsert                                | `INSERT ... ON DUPLICATE KEY UPDATE` / `INSERT ... ON CONFLICT DO UPDATE`              | Same as W4 when the array changes. Also covers REPLACE on MariaDB (finding #4). |
-| W8 | Large arrays                          | W1, W3, W4 with `long`                                                                | Write cost grows with array length on both; compare the slope. |
+| W1 | Bulk load, index present              | multi-row `INSERT` of all rows (as `prepare`)                                         | H9: PostgreSQL with `fastupdate` faster per row; MariaDB writes one side-table row per element during the statement. Report rows/s. |
+| W2 | Index build on loaded table           | `ALTER TABLE ... ADD INDEX` / `CREATE INDEX`                                          | H10: Measures bulk index creation; PostgreSQL sorts keys; MariaDB fills the side table row by row. |
+| W3 | Single-row inserts, concurrent        | `INSERT ... VALUES (...)`                                                             | H9: PostgreSQL faster until the pending list is merged, then periodic stalls. Report latency percentiles, not only TPS. |
+| W4 | Update the array                      | `UPDATE t SET attributes = ... WHERE id = ?` (replace 1 of the tags)                  | H11: MariaDB: delete and insert all of the row's entries. PostgreSQL: a new row version with all its GIN entries, old ones left for vacuum. |
+| W5 | Update another column                 | `UPDATE t SET payload = ... WHERE id = ?`                                             | H12: MariaDB should skip the side table (`update_needed`); PostgreSQL may use a HOT update if no indexed column changes. Both should be cheap; checks that neither touches the array index. |
+| W6 | Delete                                | `DELETE FROM t WHERE id = ?`                                                          | H11: MariaDB deletes the entries at once; PostgreSQL leaves them for vacuum. |
+| W7 | Upsert                                | `INSERT ... ON DUPLICATE KEY UPDATE` / `INSERT ... ON CONFLICT DO UPDATE`              | H11: Same as W4 when the array changes. Also covers REPLACE on MariaDB (finding #4). |
+| W8 | Large arrays                          | W1, W3, W4 with `long`                                                                | H13: Write cost grows with array length on both; compare the slope. |
 
 ## Mixed workloads
 
 | #  | Workload                | Mix                                    | What to look for |
 |----|-------------------------|----------------------------------------|------------------|
-| M1 | Read-mostly             | 95% R1, 5% W4                          | Read latency stays stable on both. |
-| M2 | Write-heavy             | 50% R1, 50% W3/W4                      | PostgreSQL pending-list growth and merges as read-latency spikes; MariaDB lock contention on the side table. |
-| M3 | Long run with churn     | M2 for 1 hour                          | Index bloat and vacuum on PostgreSQL; side-table growth on MariaDB; throughput over time. |
+| M1 | Read-mostly             | 95% R1, 5% W4                          | H14: Read latency stays stable on both. |
+| M2 | Write-heavy             | 50% R1, 50% W3/W4                      | H9, H14: PostgreSQL pending-list growth and merges as read-latency spikes; MariaDB lock contention on the side table. |
+| M3 | Long run with churn     | M2 for 1 hour                          | H11: Index bloat and vacuum on PostgreSQL; side-table growth on MariaDB; throughput over time. |
 
 ## Space
 
@@ -109,7 +135,7 @@ After W1, after W4 for 10% of rows, and after M3:
 - PostgreSQL: `pg_relation_size()` of the table and each index, and the
   pending list (`gin_metapage_info()` from `pageinspect`).
 
-Expectation: GIN posting lists are compact for common values; MariaDB stores
+Expectation (H15): GIN posting lists are compact for common values; MariaDB stores
 one B-tree row per element, including the row reference, so it should be
 larger, more so with `skewed` data.
 
