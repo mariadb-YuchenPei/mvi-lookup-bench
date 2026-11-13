@@ -35,8 +35,22 @@ elif [[ "$1" == "mariadb" ]]; then
     --index-type=mariadb_array
   )
 
+elif [[ "$1" == "pg" ]]; then
+
+  # --pgsql-host may also be a socket directory, e.g. /tmp
+  SERVER=pgsql
+  SYSBENCH_COMMON_ARGS=(
+    --db-driver=pgsql
+    --pgsql-host=127.0.0.1
+    --pgsql-port=5432
+    --pgsql-user=$USER
+    --pgsql-db=test
+    --rand-type=uniform
+    --index-type=pg_gin
+  )
+
 else
-  echo "Need argument: mysql, mariadb_ft_json or mariadb"
+  echo "Need argument: mysql, mariadb_ft_json, mariadb or pg"
   exit 1
 fi
 

@@ -1,7 +1,7 @@
 -- mvi_test.lua
 sysbench.cmdline.options = {
     table_size = {"Number of rows in the table", 1000000},
-    index_type = {"Index to use: ft_json, array or mariadb_array"},
+    index_type = {"Index to use: ft_json, array, mariadb_array or pg_gin"},
     query_type = {"Lookup to benchmark: member (multi-valued index) or " ..
                   "attr1 (plain index on the first tag)", "member"}
 }
@@ -73,6 +73,19 @@ function cmd_prepare()
         con:query(create_table_ft_json)
     elseif index_type == "mariadb_array" then
         con:query(create_table_mariadb_array)
+    elseif index_type == "pg_gin" then
+        -- PostgreSQL: a GIN index on the tags array, the counterpart of the
+        -- multi-valued index; indexes are created separately
+        con:query([[
+            CREATE TABLE mvi_benchmark (
+                id SERIAL PRIMARY KEY,
+                attributes JSONB,
+                attr1 VARCHAR(32)
+            )
+        ]])
+        con:query("CREATE INDEX idx_attributes ON mvi_benchmark " ..
+                  "USING GIN ((attributes->'tags') jsonb_path_ops)")
+        con:query("CREATE INDEX idx_attr1 ON mvi_benchmark (attr1)")
     else
         con:query(create_table_array)
     end
@@ -117,6 +130,10 @@ function cmd_prepare()
         query = query .. table.concat(values, ", ")
         con:query(query)
     end
+    if index_type == "pg_gin" then
+        -- PostgreSQL needs statistics to choose the indexes
+        con:query("ANALYZE mvi_benchmark")
+    end
     print("Prepare phase complete.")
     con:disconnect()
 end
@@ -145,6 +162,11 @@ local sql_for = {
             "SELECT id FROM mvi_benchmark WHERE 'value-%d' MEMBER OF(attributes)", tag)
     end,
 
+    member_pg_gin = function(tag)
+        return string.format(
+            "SELECT id FROM mvi_benchmark WHERE attributes->'tags' @> '[\"value-%d\"]'", tag)
+    end,
+
     member_array = function(tag)
         return string.format(
             "SELECT id FROM mvi_benchmark WHERE 'value-%d' MEMBER OF(attributes->'$.tags')", tag)
@@ -162,7 +184,7 @@ local sql_for = {
 local function resolve_query()
     local index_type = sysbench.opt.index_type
     if (index_type ~= "ft_json" and index_type ~= "array" and
-        index_type ~= "mariadb_array") then
+        index_type ~= "mariadb_array" and index_type ~= "pg_gin") then
        error("The argument --index-type must be set")
     end
 
@@ -172,6 +194,8 @@ local function resolve_query()
         query_type = "member_ft_json"
       elseif index_type == "mariadb_array" then
         query_type = "member_mariadb_array"
+      elseif index_type == "pg_gin" then
+        query_type = "member_pg_gin"
       else
         query_type = "member_array"
       end
@@ -200,7 +224,11 @@ function cmd_explain()
 
     -- EXPLAIN FORMAT=JSON returns a single row with a single column, so
     -- query_row() gives us the whole plan as one string.
-    local plan = con:query_row("EXPLAIN FORMAT=JSON " .. query)
+    local explain = "EXPLAIN FORMAT=JSON "
+    if sysbench.opt.index_type == "pg_gin" then
+        explain = "EXPLAIN (FORMAT JSON) "
+    end
+    local plan = con:query_row(explain .. query)
     print(plan or "(no plan returned)")
 
     con:disconnect()

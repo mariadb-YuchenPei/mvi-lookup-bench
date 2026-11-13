@@ -6,8 +6,9 @@ It tests
 * MySQL: Multi-Value Index
 * MariaDB: Emulation of multi-value index through Fulltext.
 * MariaDB: Multi-Value Index (MDEV-25848)
+* PostgreSQL: GIN index on the JSONB tags array
 
 Usage:
 ```
-  run-mvi-benchmark.sh  (mysql|mariadb_ft_json|mariadb)
+  run-mvi-benchmark.sh  (mysql|mariadb_ft_json|mariadb|pg)
 ```
