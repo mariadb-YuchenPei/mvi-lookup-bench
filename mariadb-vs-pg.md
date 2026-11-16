@@ -103,7 +103,10 @@ compared with a bitmap OR.
   branch (bounding the range optimizer work) only change planning time for
   large JSON constants, not the planned workloads. Table layout: `attributes JSON` holding the bare tags array,
   `INDEX (CAST(attributes AS CHAR(32) ARRAY))`.
-- **PostgreSQL**: a current release. Two index variants, run separately:
+- **PostgreSQL**: 18, at the latest minor release when the runs are made
+  (18.7 at the time of writing; 19 is still a release candidate). Record
+  `SELECT version()` with the results. Optionally re-run the priority 1
+  workloads on 19 once it's released. Two index variants, run separately:
   - `pg`: `GIN ((attributes->'tags') jsonb_path_ops)` on `{"tags": [...]}`,
     as in `mvi_test.lua` today;
   - `pg_array`: a `text[]` column with `GIN (tags)` (`array_ops`). This is
@@ -120,6 +123,22 @@ compared with a bitmap OR.
   - PostgreSQL: autovacuum on (as in production), `ANALYZE` after loading;
     GIN `fastupdate` on (default), with an extra run with it off for the
     write workloads.
+  - PostgreSQL settings recorded with every run, because they affect these
+    workloads:
+    - `shared_buffers`;
+    - `work_mem`: bitmaps larger than it become lossy, which adds rechecks
+      (R2, R3, R7);
+    - `effective_io_concurrency` and `io_method`: asynchronous I/O for
+      bitmap heap scans, new in 18 (R2, R7 when data isn't cached);
+    - `max_parallel_workers_per_gather`: parallel bitmap heap scans. Set it
+      to 0 for the comparison, since MariaDB doesn't scan the index in
+      parallel, and report a run with the default separately;
+    - `max_parallel_maintenance_workers`: parallel GIN index builds, new in
+      18 (W2). Run W2 serial and parallel;
+    - GIN `fastupdate` and `gin_pending_list_limit` (W1, W3, M2);
+    - autovacuum settings (M3).
+  - MariaDB settings recorded likewise: `innodb_buffer_pool_size`,
+    `eq_range_index_dive_limit`, `optimizer_switch`.
 - **Thread counts**: 1, 4 and 8 (one per server hardware thread). 1 shows
   per-query cost; 8 shows scaling.
 
