@@ -195,6 +195,39 @@ R1-R9 also run with `pg_array` (`tags @> ARRAY['v']`, `tags && ARRAY[...]`).
 | M2 | Write-heavy             | 50% R1, 50% W3/W4                      | H9, H14: PostgreSQL pending-list growth and merges as read-latency spikes; MariaDB lock contention on the side table. |
 | M3 | Long run with churn     | M2 for 1 hour                          | H11: Index bloat and vacuum on PostgreSQL; side-table growth on MariaDB; throughput over time. |
 
+## Baselines
+
+Each workload also runs against a control that does the same work without
+the array index, on the same server and data. Report each result as a
+ratio to its control (`member` / `attr1` for R1) as well as in absolute
+numbers. The ratio isolates the cost of the array index from the server's
+general speed, so it is the number to compare between MariaDB and
+PostgreSQL.
+
+`attr1` and `attr2` hold copies of the first and second tags, each with a
+B-tree index. Under `skewed`, a value is less frequent in `attr1` than in
+the arrays, so for R2, R7 and R8 pick control values whose `attr1` match
+counts are close to the array match counts, and also report time per
+matched row.
+
+| Workload   | Control                                                    | What the ratio shows |
+|------------|------------------------------------------------------------|----------------------|
+| R1         | `attr1 = 'v'` (implemented)                                | probe cost of the array index or GIN against a B-tree (H1, H8) |
+| R2, R7, R8 | `attr1 = <common value>`                                   | row-fetch cost for many matches, separated from the index (H2, H5) |
+| R3         | `attr1 = 'a' AND attr2 = 'b'`                              | posting-list intersection and MariaDB's one index plus recheck, against index_merge intersect and BitmapAnd over two B-trees (H3) |
+| R4         | `attr1 IN (...20 values...)`                               | OR of many values through the array index against an IN-list range (H4) |
+| R5         | each index on its own (`attributes` alone, `created` alone) | whether combining the two indexes beats the better single index (H5, H6) |
+| R6         | `JOIN ... ON vals.v = t.attr1`                             | MariaDB's missing `ref` access through the ARRAY key against a normal `ref` join (H7) |
+| W1, W3     | same statements, table without the array index             | write cost of the array index per row (H9) |
+| W2         | `CREATE INDEX` on `attr1`                                  | build cost per element against per row (H10) |
+| W4, W6, W7 | same statements, table without the array index             | maintenance cost of the array index on update, delete and upsert (H11) |
+| W8         | W1, W3, W4 with `long`, table without the array index      | how much of the slope with array length comes from the index rather than the larger row (H13) |
+
+W5 is its own control: it should cost the same with and without the array
+index (H12). R9 is a correctness check and has none. M1-M3 use the controls
+of R1, W3 and W4, with the same mix run on the table without the array
+index.
+
 ## Space
 
 After W1, after W4 for 10% of rows, and after M3:
@@ -227,6 +260,7 @@ The benchmark compares speed only if results agree:
   (`--percentile=99`, `--histogram`).
 - For writes: rows/s, and latency over time (`--report-interval=1`) to see
   stalls.
+- Each result's ratio to its control (Baselines).
 - Index and table sizes (Space).
 - The plan for every query.
 
@@ -255,5 +289,8 @@ The benchmark compares speed only if results agree:
   transaction.
 - A `payload` column (not indexed) for W5, and a `created` column with a
   B-tree index for R5.
-- `pg_array` as another `--index-type`.
+- `pg_array` as another `--index-type`, and `--index-type=none` for the
+  table without the array index (Baselines).
+- An `attr2` column with a B-tree index holding the second tag, and a
+  control query type for each read workload (Baselines).
 - A `verify` command that prints the matched ids for the fixed value set.
