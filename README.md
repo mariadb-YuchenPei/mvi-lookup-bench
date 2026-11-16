@@ -18,6 +18,9 @@ Usage:
   `taskset -c` format (for example `8-15`). Default: no pinning. Pin the
   server separately, for example `taskset -c 0-7 mariadbd ...`.
 
+Each run is preceded by a warm-up of `WARMUP` seconds (default 10), not
+counted in the results, for example `WARMUP=30 run-mvi-benchmark.sh pg`.
+
 For example, 8 client threads pinned to CPUs 8-15:
 ```
   run-mvi-benchmark.sh mariadb 8 8-15

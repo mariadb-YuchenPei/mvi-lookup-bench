@@ -24,6 +24,30 @@ sysbench.cmdline.commands = {
     }
 }
 
+-- MySQL and MariaDB: wait, up to timeout seconds, until InnoDB has written
+-- out all dirty pages, by setting innodb_max_dirty_pages_pct to 0 for the
+-- duration. Otherwise the page cleaner writes out the loaded data during
+-- the first runs.
+local function flush_innodb(con, timeout)
+    local pct = con:query_row("SELECT @@GLOBAL.innodb_max_dirty_pages_pct")
+    con:query("SET GLOBAL innodb_max_dirty_pages_pct = 0")
+    local dirty
+    for _ = 1, timeout do
+        local _, value = con:query_row(
+            "SHOW GLOBAL STATUS LIKE 'Innodb_buffer_pool_pages_dirty'")
+        dirty = tonumber(value)
+        if dirty == 0 then
+            break
+        end
+        os.execute("sleep 1")
+    end
+    con:query("SET GLOBAL innodb_max_dirty_pages_pct = " .. pct)
+    if dirty ~= 0 then
+        print(string.format("Warning: %d dirty pages left after %d seconds",
+                            dirty, timeout))
+    end
+end
+
 function cmd_prepare()
     local drv = sysbench.sql.driver()
     local con = drv:connect()
@@ -131,8 +155,18 @@ function cmd_prepare()
         con:query(query)
     end
     if index_type == "pg_gin" then
-        -- PostgreSQL needs statistics to choose the indexes
-        con:query("ANALYZE mvi_benchmark")
+        -- PostgreSQL needs statistics to choose the indexes. VACUUM also
+        -- merges the GIN pending list, sets hint bits and the visibility
+        -- map, and CHECKPOINT writes out the dirty pages, so that neither
+        -- autovacuum nor a checkpoint is left to run during the benchmark.
+        con:query("VACUUM ANALYZE mvi_benchmark")
+        con:query("CHECKPOINT")
+    else
+        -- The same for MySQL and MariaDB: update the statistics now rather
+        -- than in the background during a run, then write out the dirty
+        -- pages, including those of the statistics.
+        con:query("ANALYZE TABLE mvi_benchmark")
+        flush_innodb(con, 600)
     end
     print("Prepare phase complete.")
     con:disconnect()
@@ -149,8 +183,10 @@ end
 
 -- Available lookups, selected with --query-type. Both search for the same
 -- "value-N" tag, but member goes through the multi-valued index while attr1
--- goes through a plain B-tree on the first tag. These only build the SQL, so
--- the same text can be either executed (run) or explained (explain).
+-- goes through a plain B-tree on the first tag. attr1 also selects
+-- attributes, so that like member it reads the row rather than only the
+-- index. These only build the SQL, so the same text can be either executed
+-- (run) or explained (explain).
 local sql_for = {
     member_ft_json = function(tag)
         return string.format(
@@ -174,7 +210,7 @@ local sql_for = {
 
     attr1 = function(tag)
         return string.format(
-            "SELECT id FROM mvi_benchmark WHERE attr1 = 'value-%d'", tag)
+            "SELECT id, attributes FROM mvi_benchmark WHERE attr1 = 'value-%d'", tag)
     end
 }
 

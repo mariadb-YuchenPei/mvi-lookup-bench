@@ -70,6 +70,9 @@ if [[ -n "$CPUS" ]]; then
   PIN=(taskset -c "$CPUS")
 fi
 
+# Seconds of warm-up before each measured run, not counted in the results
+WARMUP=${WARMUP:-10}
+
 LOG_FILE="$RESULT_NAME-$SERVER-thr-$THREADS"
 
 # Output CSV headers
@@ -90,16 +93,22 @@ for SIZE in "${TABLE_SIZES[@]}"; do
 	--query-type=$QUERY_TYPE --table-size=$SIZE \
 	explain
 
-    # 2. Run workload and capture output
+    # 2. Warm up with the same workload, discarding the results (a separate
+    # run, as not every sysbench version has --warmup-time)
+    if (( WARMUP > 0 )); then
+      "${PIN[@]}" sysbench $TEST_NAME "${SYSBENCH_COMMON_ARGS[@]}" --query-type=$QUERY_TYPE --table-size=$SIZE --time=$WARMUP --threads=$THREADS run > /dev/null
+    fi
+
+    # 3. Run workload and capture output
     OUTPUT=$("${PIN[@]}" sysbench $TEST_NAME "${SYSBENCH_COMMON_ARGS[@]}" --query-type=$QUERY_TYPE --table-size=$SIZE --time=30 --threads=$THREADS run)
 
-    # 2.1. Parse TPS and QPS from output
+    # 3.1. Parse TPS and QPS from output
     TPS=$(echo "$OUTPUT" | awk -F'(' '/transactions:/ {print $2}' | awk '{print $1}')
     #QPS=$(echo "$OUTPUT" | awk -F'(' '/queries:/ {print $2}' | awk '{print $1}')
 
     echo "Result($QUERY_TYPE) -> Table Size: $SIZE | TPS: $TPS | QPS: $QPS"
 
-    # 2.3. Append to CSV
+    # 3.3. Append to CSV
     echo "$SIZE,$TPS" >> $LOG_FILE-$QUERY_TYPE.csv
 
   done
