@@ -4,7 +4,8 @@ Draft, 2026-11-13.
 
 This document plans benchmark runs comparing MariaDB's multi-valued index
 (MVI, MDEV-25848) with PostgreSQL's GIN index on JSONB, for reads and for
-writes. The current `mvi_test.lua` covers only R1 below. Every expectation
+writes. `mvi_test.lua` covers R1, and the priority 1 workloads R3, R5 and
+R6 with their controls (`run-mvi-benchmark.sh ... p1`). Every expectation
 here is a hypothesis from how the two indexes are built (see "Hypotheses");
 the point of the runs is to confirm or refute them.
 
@@ -120,9 +121,13 @@ compared with a bitmap OR.
   - CPU frequency fixed (`performance` governor, turbo off) where possible;
   - each run repeated 3-5 times, medians reported; 60-120 s per run after a
     warm-up;
-  - PostgreSQL: autovacuum on (as in production), `ANALYZE` after loading;
+  - PostgreSQL: autovacuum on (as in production); `VACUUM ANALYZE` and
+    `CHECKPOINT` after loading, so that read runs start with the GIN
+    pending list merged and no autovacuum or checkpoint left to run;
     GIN `fastupdate` on (default), with an extra run with it off for the
     write workloads.
+  - MariaDB: `ANALYZE TABLE` after loading, then wait until InnoDB has no
+    dirty pages left, for the same reason.
   - PostgreSQL settings recorded with every run, because they affect these
     workloads:
     - `shared_buffers`;
@@ -147,10 +152,15 @@ compared with a bitmap OR.
 | Name      | Tags per row         | Tag distribution                 | Purpose                                     |
 |-----------|----------------------|----------------------------------|---------------------------------------------|
 | `uniform` | 1-2 (current)        | uniform over `table_size` values | selective lookups, about 1.5 rows per value |
-| `skewed`  | 1-5                  | Zipf over 10 000 values          | common and rare values in the same table    |
+| `skewed`  | 1-5                  | Pareto over 10 000 values        | common and rare values in the same table    |
 | `long`    | 20-50                | uniform over 100 000 values      | large arrays: index size, write cost        |
 | `strings` | 1-2                  | uniform; values over 16 bytes    | MariaDB's hashed strings vs short strings   |
 | `numbers` | 1-2                  | uniform integers                 | number encoding and equality                |
+
+`skewed` uses sysbench's Pareto distribution with `--rand-pareto-h=0.3`:
+roughly 6% of the tags drawn are the most common value and 16% are among the
+20 most common. sysbench's default (0.2) puts the most common value in most
+rows, and released sysbench versions have no Zipf distribution.
 
 Table sizes: 100k, 1M, 10M rows (10M only for `uniform` and `skewed`). The
 same random seed is used for every server, so all servers hold the same
@@ -279,18 +289,22 @@ The benchmark compares speed only if results agree:
 
 ## Implementation in `mvi_test.lua`
 
-- `--data-set=uniform|skewed|long|strings|numbers` for `prepare`, with a
-  fixed `--rand-seed`.
-- `--query-type` gains `common`, `and2`, `or20`, `with_range`, `join`,
-  `count`, `limit`, `number` (R2-R9).
+Done: `--data-set=uniform|skewed`, query types `and2` (R3), `with_range`
+(R5) and `join` (R6) with their controls `and2_attr`, `range_only` and
+`join_attr1`, the `attr2` and `created` columns, the `mvi_vals` outer table
+for joins, and a `verify` command that prints the number and the sum of the
+ids matched by a fixed set of queries. Remaining:
+
+- `--data-set=long|strings|numbers`.
+- `--query-type` gains `common`, `or20`, `count`, `limit`, `number` (R2,
+  R4, R7-R9).
 - `--write-type=insert|update_array|update_other|delete|upsert` (W3-W7)
   as separate events; W1 is `prepare`, W2 a separate `index` command.
 - `--mix=read_mostly|write_heavy` (M1, M2), choosing the event per
   transaction.
-- A `payload` column (not indexed) for W5, and a `created` column with a
-  B-tree index for R5.
+- A `payload` column (not indexed) for W5.
 - `pg_array` as another `--index-type`, and `--index-type=none` for the
   table without the array index (Baselines).
-- An `attr2` column with a B-tree index holding the second tag, and a
-  control query type for each read workload (Baselines).
-- A `verify` command that prints the matched ids for the fixed value set.
+- A control query type for each remaining read workload (Baselines).
+- Repeating each run and reporting the median, with 60-120 s runs (Systems
+  and setup); `run-mvi-benchmark.sh` does one 30 s run per query type.

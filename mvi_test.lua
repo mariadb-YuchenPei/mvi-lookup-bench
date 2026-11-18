@@ -2,8 +2,20 @@
 sysbench.cmdline.options = {
     table_size = {"Number of rows in the table", 1000000},
     index_type = {"Index to use: ft_json, array, mariadb_array or pg_gin"},
-    query_type = {"Lookup to benchmark: member (multi-valued index) or " ..
-                  "attr1 (plain index on the first tag)", "member"}
+    query_type = {"Lookup to benchmark: member, attr1, and2, and2_attr, " ..
+                  "with_range, range_only, join or join_attr1", "member"},
+    data_set = {"Data to load and query: uniform (1-2 tags per row, " ..
+                "uniform over table_size values) or skewed (1-5 tags per " ..
+                "row, Pareto over --skewed-values values, skew set by " ..
+                "--rand-pareto-h)", "uniform"},
+    skewed_values = {"Number of distinct tags in the skewed data set", 10000},
+    common_values = {"and2 and and2_attr pick both tags from the " ..
+                     "--common-values most common ones", 20},
+    range_pct = {"Width of the created range in with_range and " ..
+                 "range_only, in percent of the rows", 1},
+    join_values = {"Number of tags joined per query in join and join_attr1", 10},
+    join_groups = {"Number of tag groups to pick from in join and join_attr1", 1000},
+    verify_count = {"Number of queries run by the verify command", 100}
 }
 
 -- Map the standard Sysbench commands to our custom Lua functions
@@ -21,8 +33,77 @@ sysbench.cmdline.commands = {
     explain = {
         function() cmd_explain() end,
         sysbench.cmdline.DESC_DEFAULT
+    },
+    -- Print the number and the sum of the ids matched by --verify-count
+    -- instances of the lookup, to compare results between servers.
+    verify = {
+        function() cmd_verify() end,
+        sysbench.cmdline.DESC_DEFAULT
     }
 }
+
+local function check_data_set()
+    local data_set = sysbench.opt.data_set
+    if data_set ~= "uniform" and data_set ~= "skewed" then
+        error(string.format("unknown --data-set '%s' (expected: uniform, skewed)",
+                            data_set))
+    end
+end
+
+-- Number of distinct tags in the data set: tags are "value-1" to
+-- "value-<domain>".
+local function tag_domain()
+    if sysbench.opt.data_set == "skewed" then
+        return sysbench.opt.skewed_values
+    end
+    return sysbench.opt.table_size
+end
+
+-- One tag drawn with the data set's distribution. In the skewed data set
+-- "value-1" is the most common tag. Pareto rather than Zipf, which
+-- released sysbench versions (up to 1.0.20) don't have.
+local function data_tag()
+    if sysbench.opt.data_set == "skewed" then
+        return sysbench.rand.pareto(1, sysbench.opt.skewed_values)
+    end
+    return sysbench.rand.default(1, sysbench.opt.table_size)
+end
+
+-- n distinct tags, each drawn with draw()
+local function distinct_tags(n, draw)
+    local tags, seen = {}, {}
+    while #tags < n do
+        local t = draw()
+        if not seen[t] then
+            seen[t] = true
+            table.insert(tags, t)
+        end
+    end
+    return tags
+end
+
+-- The tags of one row. The draws don't depend on --index-type, so with the
+-- same --rand-seed every server gets the same data.
+local function row_tags()
+    if sysbench.opt.data_set == "skewed" then
+        return distinct_tags(sysbench.rand.uniform(1, 5), data_tag)
+    end
+    -- 1 or 2 tags (50/50)
+    local t1 = data_tag()
+    if sysbench.rand.uniform(1, 2) == 1 then
+        return {t1}
+    end
+    return {t1, data_tag()}
+end
+
+-- JSON array of "value-N" strings
+local function json_tags(tags)
+    local quoted = {}
+    for i, t in ipairs(tags) do
+        quoted[i] = string.format("\"value-%d\"", t)
+    end
+    return "[" .. table.concat(quoted, ", ") .. "]"
+end
 
 -- MySQL and MariaDB: wait, up to timeout seconds, until InnoDB has written
 -- out all dirty pages, by setting innodb_max_dirty_pages_pct to 0 for the
@@ -49,25 +130,34 @@ local function flush_innodb(con, timeout)
 end
 
 function cmd_prepare()
+    check_data_set()
     local drv = sysbench.sql.driver()
     local con = drv:connect()
 
     local index_type = sysbench.opt.index_type
 
-    print("Creating table mvi_benchmark...")
+    print("Creating tables mvi_benchmark and mvi_vals...")
     con:query("DROP TABLE IF EXISTS mvi_benchmark")
+    con:query("DROP TABLE IF EXISTS mvi_vals")
 
     if index_type == "ft_json" then
         con:query("INSTALL SONAME 'ft_json'")
     end
 
+    -- attr1 and attr2 hold the first and second tags, and created a random
+    -- number between 1 and table_size, each with a B-tree index: they are
+    -- the controls of the array lookups and the range of with_range.
     local create_table_ft_json = [[
         CREATE TABLE mvi_benchmark (
             id INT AUTO_INCREMENT PRIMARY KEY,
             attributes TEXT,
             attr1 VARCHAR(32),
+            attr2 VARCHAR(32),
+            created INT,
             FULLTEXT INDEX idx_attributes (attributes) WITH PARSER ft_json,
-            INDEX idx_attr1 (attr1)
+            INDEX idx_attr1 (attr1),
+            INDEX idx_attr2 (attr2),
+            INDEX idx_created (created)
         )
     ]]
 
@@ -76,8 +166,12 @@ function cmd_prepare()
             id INT AUTO_INCREMENT PRIMARY KEY,
             attributes JSON,
             attr1 VARCHAR(32),
+            attr2 VARCHAR(32),
+            created INT,
             INDEX idx_attributes ((CAST(attributes->'$.tags' AS BINARY(32) ARRAY))),
-            INDEX idx_attr1 (attr1)
+            INDEX idx_attr1 (attr1),
+            INDEX idx_attr2 (attr2),
+            INDEX idx_created (created)
         )
     ]]
 
@@ -88,8 +182,12 @@ function cmd_prepare()
             id INT AUTO_INCREMENT PRIMARY KEY,
             attributes JSON,
             attr1 VARCHAR(32),
+            attr2 VARCHAR(32),
+            created INT,
             INDEX idx_attributes (CAST(attributes AS CHAR(32) ARRAY)),
-            INDEX idx_attr1 (attr1)
+            INDEX idx_attr1 (attr1),
+            INDEX idx_attr2 (attr2),
+            INDEX idx_created (created)
         )
     ]]
 
@@ -104,14 +202,39 @@ function cmd_prepare()
             CREATE TABLE mvi_benchmark (
                 id SERIAL PRIMARY KEY,
                 attributes JSONB,
-                attr1 VARCHAR(32)
+                attr1 VARCHAR(32),
+                attr2 VARCHAR(32),
+                created INT
             )
         ]])
         con:query("CREATE INDEX idx_attributes ON mvi_benchmark " ..
                   "USING GIN ((attributes->'tags') jsonb_path_ops)")
         con:query("CREATE INDEX idx_attr1 ON mvi_benchmark (attr1)")
+        con:query("CREATE INDEX idx_attr2 ON mvi_benchmark (attr2)")
+        con:query("CREATE INDEX idx_created ON mvi_benchmark (created)")
     else
         con:query(create_table_array)
+    end
+
+    -- The outer table of join and join_attr1: join_groups groups of
+    -- join_values distinct tags, drawn uniformly over all tags, so that most
+    -- are rare and the cost is in finding the matches.
+    con:query([[
+        CREATE TABLE mvi_vals (
+            grp INT,
+            val VARCHAR(32),
+            PRIMARY KEY (grp, val)
+        )
+    ]])
+    local domain = tag_domain()
+    local draw_any = function() return sysbench.rand.uniform(1, domain) end
+    for g = 1, sysbench.opt.join_groups do
+        local values = {}
+        for _, t in ipairs(distinct_tags(sysbench.opt.join_values, draw_any)) do
+            table.insert(values, string.format("(%d, 'value-%d')", g, t))
+        end
+        con:query("INSERT INTO mvi_vals (grp, val) VALUES " ..
+                  table.concat(values, ", "))
     end
 
     print(string.format("Inserting %d rows (using batches of 1000)...", sysbench.opt.table_size))
@@ -119,36 +242,25 @@ function cmd_prepare()
     -- Batch inserts for faster data population
     local batch_size = 1000
     for i = 1, sysbench.opt.table_size, batch_size do
-        local query = "INSERT INTO mvi_benchmark (attributes, attr1) VALUES "
+        local query = "INSERT INTO mvi_benchmark (attributes, attr1, attr2, created) VALUES "
         local values = {}
         local end_idx = math.min(i + batch_size - 1, sysbench.opt.table_size)
 
         for j = i, end_idx do
-            -- Generate a JSON array with 1 or 2 random tags (50/50), each of the
-            -- form "value-N" with N between 1 and table_size. attr1 duplicates
-            -- the first array element as a plain indexed column, so the same
-            -- lookup can be benchmarked with and without the multi-valued index.
-            local t1 = sysbench.rand.default(1, sysbench.opt.table_size)
-            if index_type == "mariadb_array" then
-                -- attributes is the tags array itself, see above
-                if sysbench.rand.uniform(1, 2) == 1 then
-                    table.insert(values,
-                        string.format("('[\"value-%d\"]', 'value-%d')", t1, t1))
-                else
-                    local t2 = sysbench.rand.default(1, sysbench.opt.table_size)
-                    table.insert(values,
-                        string.format("('[\"value-%d\", \"value-%d\"]', 'value-%d')",
-                                      t1, t2, t1))
-                end
-            elseif sysbench.rand.uniform(1, 2) == 1 then
-                table.insert(values,
-                    string.format("('{\"tags\": [\"value-%d\"]}', 'value-%d')", t1, t1))
-            else
-                local t2 = sysbench.rand.default(1, sysbench.opt.table_size)
-                table.insert(values,
-                    string.format("('{\"tags\": [\"value-%d\", \"value-%d\"]}', 'value-%d')",
-                                  t1, t2, t1))
+            local tags = row_tags()
+            local doc = json_tags(tags)
+            if index_type ~= "mariadb_array" then
+                -- attributes is the tags array itself for mariadb_array,
+                -- see above
+                doc = "{\"tags\": " .. doc .. "}"
             end
+            local attr2 = "NULL"
+            if tags[2] then
+                attr2 = string.format("'value-%d'", tags[2])
+            end
+            table.insert(values,
+                string.format("('%s', 'value-%d', %s, %d)", doc, tags[1], attr2,
+                              sysbench.rand.uniform(1, sysbench.opt.table_size)))
         end
 
         query = query .. table.concat(values, ", ")
@@ -160,12 +272,13 @@ function cmd_prepare()
         -- map, and CHECKPOINT writes out the dirty pages, so that neither
         -- autovacuum nor a checkpoint is left to run during the benchmark.
         con:query("VACUUM ANALYZE mvi_benchmark")
+        con:query("VACUUM ANALYZE mvi_vals")
         con:query("CHECKPOINT")
     else
         -- The same for MySQL and MariaDB: update the statistics now rather
         -- than in the background during a run, then write out the dirty
         -- pages, including those of the statistics.
-        con:query("ANALYZE TABLE mvi_benchmark")
+        con:query("ANALYZE TABLE mvi_benchmark, mvi_vals")
         flush_innodb(con, 600)
     end
     print("Prepare phase complete.")
@@ -176,71 +289,164 @@ function cmd_cleanup()
     local drv = sysbench.sql.driver()
     local con = drv:connect()
 
-    print("Cleaning up table mvi_benchmark...")
+    print("Cleaning up tables mvi_benchmark and mvi_vals...")
     con:query("DROP TABLE IF EXISTS mvi_benchmark")
+    con:query("DROP TABLE IF EXISTS mvi_vals")
     con:disconnect()
 end
 
--- Available lookups, selected with --query-type. Both search for the same
--- "value-N" tag, but member goes through the multi-valued index while attr1
--- goes through a plain B-tree on the first tag. attr1 also selects
--- attributes, so that like member it reads the row rather than only the
--- index. These only build the SQL, so the same text can be either executed
--- (run) or explained (explain).
-local sql_for = {
-    member_ft_json = function(tag)
-        return string.format(
-            "SELECT id FROM mvi_benchmark WHERE MATCH(attributes) AGAINST ('tags.0=value-%d' IN BOOLEAN MODE)", tag)
-    end,
+-- The created range of with_range and range_only: range_pct percent of the
+-- rows, at a random position.
+local function created_range()
+    local size = sysbench.opt.table_size
+    local width = math.max(1, math.floor(size * sysbench.opt.range_pct / 100))
+    local lo = sysbench.rand.uniform(1, math.max(1, size - width + 1))
+    return lo, lo + width - 1
+end
 
-    member_mariadb_array = function(tag)
-        return string.format(
-            "SELECT id FROM mvi_benchmark WHERE 'value-%d' MEMBER OF(attributes)", tag)
-    end,
+-- Two distinct tags among the common_values most common ones. In the skewed
+-- data set each is in many rows, and both together in few (R3).
+local function common_pair()
+    local n = math.min(sysbench.opt.common_values, tag_domain())
+    local draw = function() return sysbench.rand.uniform(1, n) end
+    return distinct_tags(2, draw)
+end
 
-    member_pg_gin = function(tag)
-        return string.format(
-            "SELECT id FROM mvi_benchmark WHERE attributes->'tags' @> '[\"value-%d\"]'", tag)
-    end,
+-- The array lookups of each --index-type, with tag(s) as their argument:
+-- member (one tag) and and2 (all tags of a JSON array). ft_json only has
+-- member.
+local array_sql = {
+    ft_json = {
+        member = function(t)
+            return string.format(
+                "MATCH(attributes) AGAINST ('tags.0=value-%d' IN BOOLEAN MODE)", t)
+        end
+    },
+    mariadb_array = {
+        member = function(t)
+            return string.format("'value-%d' MEMBER OF(attributes)", t)
+        end,
+        and2 = function(tags)
+            return string.format("JSON_CONTAINS(attributes, '%s')", json_tags(tags))
+        end,
+        join = "j.val MEMBER OF(t.attributes)"
+    },
+    pg_gin = {
+        member = function(t)
+            return string.format("attributes->'tags' @> '[\"value-%d\"]'", t)
+        end,
+        and2 = function(tags)
+            return string.format("attributes->'tags' @> '%s'", json_tags(tags))
+        end,
+        join = "t.attributes->'tags' @> jsonb_build_array(j.val)"
+    },
+    array = {
+        member = function(t)
+            return string.format("'value-%d' MEMBER OF(attributes->'$.tags')", t)
+        end,
+        and2 = function(tags)
+            return string.format("JSON_CONTAINS(attributes->'$.tags', '%s')",
+                                 json_tags(tags))
+        end,
+        join = "j.val MEMBER OF(t.attributes->'$.tags')"
+    }
+}
 
-    member_array = function(tag)
-        return string.format(
-            "SELECT id FROM mvi_benchmark WHERE 'value-%d' MEMBER OF(attributes->'$.tags')", tag)
+-- Available lookups, selected with --query-type. Each returns a function
+-- that draws the arguments and builds the SQL, or nil if --index-type
+-- doesn't support it. They only build the SQL, so the same text can be
+-- executed (run), explained (explain) or checked (verify). The *_attr*
+-- and range_only lookups are the B-tree controls of the others. They also
+-- select attributes, so that like the array lookups they read the row
+-- rather than only the index.
+local query_types = {
+    -- R1 on uniform; R1 and R2 on skewed
+    member = function(a)
+        return function()
+            return "SELECT id FROM mvi_benchmark WHERE " .. a.member(data_tag())
+        end
     end,
-
-    attr1 = function(tag)
-        return string.format(
-            "SELECT id, attributes FROM mvi_benchmark WHERE attr1 = 'value-%d'", tag)
+    attr1 = function()
+        return function()
+            return string.format(
+                "SELECT id, attributes FROM mvi_benchmark WHERE attr1 = 'value-%d'",
+                data_tag())
+        end
+    end,
+    -- R3: AND of two common tags
+    and2 = function(a)
+        if not a.and2 then return nil end
+        return function()
+            return "SELECT id FROM mvi_benchmark WHERE " .. a.and2(common_pair())
+        end
+    end,
+    and2_attr = function()
+        return function()
+            local tags = common_pair()
+            return string.format(
+                "SELECT id, attributes FROM mvi_benchmark WHERE attr1 = 'value-%d' " ..
+                "AND attr2 = 'value-%d'", tags[1], tags[2])
+        end
+    end,
+    -- R5: one tag and a range on created
+    with_range = function(a)
+        return function()
+            local lo, hi = created_range()
+            return string.format(
+                "SELECT id FROM mvi_benchmark WHERE %s AND created BETWEEN %d AND %d",
+                a.member(data_tag()), lo, hi)
+        end
+    end,
+    range_only = function()
+        return function()
+            local lo, hi = created_range()
+            return string.format(
+                "SELECT id, attributes FROM mvi_benchmark " ..
+                "WHERE created BETWEEN %d AND %d", lo, hi)
+        end
+    end,
+    -- R6: join on membership, join_values outer rows per query
+    join = function(a)
+        if not a.join then return nil end
+        return function()
+            return string.format(
+                "SELECT t.id FROM mvi_vals j JOIN mvi_benchmark t ON %s " ..
+                "WHERE j.grp = %d", a.join,
+                sysbench.rand.uniform(1, sysbench.opt.join_groups))
+        end
+    end,
+    join_attr1 = function()
+        return function()
+            return string.format(
+                "SELECT t.id, t.attributes FROM mvi_vals j JOIN mvi_benchmark t " ..
+                "ON t.attr1 = j.val WHERE j.grp = %d",
+                sysbench.rand.uniform(1, sysbench.opt.join_groups))
+        end
     end
 }
 
 -- Resolve --index-type/--query-type into one SQL builder, so a typo fails at
 -- startup rather than running the wrong benchmark to completion. Shared by
--- thread_init() and the explain command.
+-- thread_init() and the explain and verify commands.
 local function resolve_query()
+    check_data_set()
     local index_type = sysbench.opt.index_type
-    if (index_type ~= "ft_json" and index_type ~= "array" and
-        index_type ~= "mariadb_array" and index_type ~= "pg_gin") then
+    local a = array_sql[index_type]
+    if not a then
        error("The argument --index-type must be set")
     end
 
     local query_type = sysbench.opt.query_type
-    if query_type == "member" then
-      if index_type == "ft_json" then
-        query_type = "member_ft_json"
-      elseif index_type == "mariadb_array" then
-        query_type = "member_mariadb_array"
-      elseif index_type == "pg_gin" then
-        query_type = "member_pg_gin"
-      else
-        query_type = "member_array"
-      end
+    local make = query_types[query_type]
+    if not make then
+        error(string.format("unknown --query-type '%s' (expected: member, " ..
+                            "attr1, and2, and2_attr, with_range, range_only, " ..
+                            "join, join_attr1)", query_type))
     end
-
-    local builder = sql_for[query_type]
+    local builder = make(a)
     if not builder then
-        error(string.format("unknown --query-type '%s' (expected: member, attr1)",
-                            sysbench.opt.query_type))
+        error(string.format("--query-type '%s' is not supported with " ..
+                            "--index-type '%s'", query_type, index_type))
     end
     return builder, query_type
 end
@@ -252,10 +458,11 @@ function cmd_explain()
     local con = drv:connect()
 
     local build_sql, query_type = resolve_query()
-    local query = build_sql(sysbench.rand.default(1, sysbench.opt.table_size))
+    local query = build_sql()
 
-    print(string.format("index-type: %s, query-type: %s",
-                        sysbench.opt.index_type, query_type))
+    print(string.format("index-type: %s, query-type: %s, data-set: %s",
+                        sysbench.opt.index_type, query_type,
+                        sysbench.opt.data_set))
     print(query)
 
     -- EXPLAIN FORMAT=JSON returns a single row with a single column, so
@@ -270,6 +477,38 @@ function cmd_explain()
     con:disconnect()
 end
 
+-- Custom command: run --verify-count instances of the lookup and print the
+-- number and the sum of the matched ids, per query and in total. With the
+-- same --rand-seed for prepare and verify, the output must be the same on
+-- every server.
+function cmd_verify()
+    local drv = sysbench.sql.driver()
+    local con = drv:connect()
+
+    local build_sql, query_type = resolve_query()
+    print(string.format("verify query-type: %s, data-set: %s",
+                        query_type, sysbench.opt.data_set))
+
+    local total_rows, total_sum = 0, 0
+    for i = 1, sysbench.opt.verify_count do
+        local query = build_sql()
+        local rs = con:query(query)
+        local rows, sum = 0, 0
+        for _ = 1, rs.nrows do
+            local row = rs:fetch_row()
+            rows = rows + 1
+            sum = sum + tonumber(row[1])
+        end
+        -- No SQL text here: it differs between servers, the output mustn't
+        print(string.format("%d %d %.0f", i, rows, sum))
+        total_rows = total_rows + rows
+        total_sum = total_sum + sum
+    end
+    print(string.format("total %d %.0f", total_rows, total_sum))
+
+    con:disconnect()
+end
+
 local run_query
 
 function thread_init()
@@ -278,14 +517,11 @@ function thread_init()
     drv = sysbench.sql.driver()
     con = drv:connect()
 
-    run_query = function(tag) con:query(build_sql(tag)) end
+    run_query = function() con:query(build_sql()) end
 end
 
 function event()
-    -- Pick a random tag between 1 and table_size to search for
-    local random_tag = sysbench.rand.default(1, sysbench.opt.table_size)
-
-    run_query(random_tag)
+    run_query()
 end
 
 function thread_done()
