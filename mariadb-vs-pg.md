@@ -184,6 +184,81 @@ The last column restates the relevant hypotheses for each workload.
 
 R1-R9 also run with `pg_array` (`tags @> ARRAY['v']`, `tags && ARRAY[...]`).
 
+### How rare the R3 pairs are
+
+R3 (`and2`) needs two values that are each common but rarely together. The
+`skewed` data set doesn't plant such pairs: the tags of a row are drawn
+independently, and `and2` draws both values uniformly from the 20 most
+common. This section derives how rare the pairs are as a result. A
+simulation of the generator (400k rows) agrees within a few percent.
+
+**One draw.** sysbench 1.0.20 (`sb_rand.c`) draws
+
+    X = a + floor((b - a + 1) * u^c),  u ~ U(0,1),  c = ln h / ln(1 - h)
+
+With a = 1, b = N = 10 000 and h = 0.3, c = 3.3755 and 1/c = 0.2962.
+X <= k exactly when N * u^c < k, so
+
+    F(k) = P(X <= k) = (k/N)^(1/c)
+    p_k  = P(X = k)  = N^(-1/c) * (k^(1/c) - (k-1)^(1/c)),  N^(-1/c) = 0.0653
+
+For large k, p_k ~ (1/c) * N^(-1/c) * k^(1/c - 1), a power law with
+exponent about -0.70.
+
+**One row.** A row has n tags, n uniform on 1..5, drawn independently and
+redrawn on duplicates. For small p this redrawing barely matters, so
+
+    r_k  = P(k in row)          ~ E[n] * p_k               = 3 * p_k
+    r_ab = P(a and b in row)    ~ E[n(n-1)] * p_a * p_b    = 8 * p_a * p_b
+
+since E[n(n-1)] = (0 + 2 + 6 + 12 + 20) / 5 = 8.
+
+**One pair.** Let a be the more common value (a < b) and b the cheaper one.
+MariaDB reads the rows of b and rechecks each; PostgreSQL fetches only the
+rows with both. Their ratio is
+
+    R = r_b / r_ab ~ 3 * p_b / (8 * p_a * p_b) = 3 / (8 * p_a)
+
+p_b cancels: how rare the pair is relative to its cheaper value depends
+only on the more common value a. For larger a, R ~ (3c/8) * N^(1/c) *
+a^(1 - 1/c) ~ 19 * a^0.70; small a needs the exact p_a.
+
+| a  | p_a    | r_a (rows with a) | R = 3/(8 p_a) | Simulated r_b / r_ab      |
+|----|--------|-------------------|---------------|---------------------------|
+| 1  | 0.0653 | 18.0%             | 5.7           | 5.9 (1,20), 5.9 (1,2)     |
+| 2  | 0.0149 | 4.4%              | 25            | 25.0 (2,20)               |
+| 5  | 0.0067 | 2.0%              | 56            | 58.9 (5,20), 59.3 (5,10)  |
+| 10 | 0.0040 | 1.2%              | 95            | 97.4 (10,20)              |
+| 19 | 0.0025 | 0.74%             | 151           | -                         |
+
+**Over the queries.** a and b are drawn uniformly from 1..20 without
+repetition, so the more common value m = min(a, b) has
+
+    P(m = j)  = 2 (20 - j) / (20 * 19)
+    P(m <= j) = 1 - C(20 - j, 2) / C(20, 2)
+
+| m            | Share of queries | R     |
+|--------------|------------------|-------|
+| 1            | 10%              | ~6    |
+| 2            | 9.5%             | ~25   |
+| <= 5         | 45%              | <= 56 |
+| median m = 6 | -                | ~65   |
+| >= 10        | 29%              | >= 95 |
+
+So about 90% of the R3 queries have an intersection at least 25 times
+smaller than their cheaper value, and the 10% with `value-1` about 6
+times. The measured TPS is a fixed mix of these, the same on every server
+with the same seeds. At 1M rows, b = 20 is in about 7 200 rows, of which
+about 1 200 also hold a = 1 and about 75 hold a = 10.
+
+Caveats:
+
+- R assumes MariaDB scans the cheaper value. If its estimates made it
+  choose the more common one, it reads r_a rows instead, and the ratio is
+  r_a / r_ab ~ 3 / (8 p_b), larger still.
+- At 100k rows the 20th value is in only about 700 rows, so R3 tests a
+  milder case there than at 1M or 10M.
+
 ## Write workloads
 
 | #  | Workload                              | Statement (MariaDB / PostgreSQL)                                                     | Expectation and reasoning |
