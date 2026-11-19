@@ -29,6 +29,16 @@ Usage:
     Each query type also writes a `.verify` file with the ids matched by a
     fixed set of queries; compare them between servers before comparing
     timings.
+  * `w`: the write workloads on the skewed data set, at 100k, 1M and 10M
+    rows, each once with the array index and once without it (the
+    control): load (W1, `-load-on.csv` / `-load-off.csv`, with the time to
+    settle afterwards), index build on the loaded table (W2, `-index.csv`,
+    with the `attr1` B-tree as control), single-row inserts (W3,
+    `insert`), array updates (W4, `update_array`) and a mix of 50%
+    lookups and 50% writes (M2, `write_heavy`, with the index only). The
+    run CSVs have TPS and 99th percentile latency; each run's TPS per
+    second is kept in a `.log` file, to show stalls.
+    `GIN_FASTUPDATE=off` runs PostgreSQL with GIN `fastupdate` off.
 
   Set `TABLE_SIZES` to override the table sizes, for example
   `TABLE_SIZES="100000 1000000"`.

@@ -4,8 +4,9 @@ Draft, 2026-11-13.
 
 This document plans benchmark runs comparing MariaDB's multi-valued index
 (MVI, MDEV-25848) with PostgreSQL's GIN index on JSONB, for reads and for
-writes. `mvi_test.lua` covers R1, and the priority 1 workloads R3, R5 and
-R6 with their controls (`run-mvi-benchmark.sh ... p1`). Every expectation
+writes. `mvi_test.lua` covers R1, the priority 1 workloads R3, R5 and R6
+with their controls (`run-mvi-benchmark.sh ... p1`), and the write
+workloads W1-W4 and M2 (`run-mvi-benchmark.sh ... w`). Every expectation
 here is a hypothesis from how the two indexes are built (see "Hypotheses");
 the point of the runs is to confirm or refute them.
 
@@ -380,18 +381,19 @@ Done: `--data-set=uniform|skewed`, query types `and2` (R3), `with_range`
 (R5) and `join` (R6) with their controls `and2_attr`, `range_only` and
 `join_attr1`, the `attr2` and `created` columns, the `mvi_vals` outer table
 for joins, and a `verify` command that prints the number and the sum of the
-ids matched by a fixed set of queries. Remaining:
+ids matched by a fixed set of queries. The write workloads W1 (timed
+`prepare --settle=off`, then a timed `settle`), W2 (`drop_index` and a
+timed `create_index`), W3 (`insert`), W4 (`update_array`, replacing all of
+a row's tags with new ones) and M2 (`write_heavy`), with `--array-index=off`
+as their control and `--gin-fastupdate`. Remaining:
 
 - `--data-set=long|strings|numbers`.
 - `--query-type` gains `common`, `or20`, `count`, `limit`, `number` (R2,
   R4, R7-R9).
-- `--write-type=insert|update_array|update_other|delete|upsert` (W3-W7)
-  as separate events; W1 is `prepare`, W2 a separate `index` command.
-- `--mix=read_mostly|write_heavy` (M1, M2), choosing the event per
-  transaction.
+- The write workloads W5-W8 (`update_other`, `delete`, `upsert`, `long`
+  arrays) and the mixes M1 and M3.
 - A `payload` column (not indexed) for W5.
-- `pg_array` as another `--index-type`, and `--index-type=none` for the
-  table without the array index (Baselines).
+- `pg_array` as another `--index-type`.
 - A control query type for each remaining read workload (Baselines).
 - Controls that match the same rows as their workloads, through a tag
   table (TODO in Baselines).

@@ -2,8 +2,10 @@
 sysbench.cmdline.options = {
     table_size = {"Number of rows in the table", 1000000},
     index_type = {"Index to use: ft_json, array, mariadb_array or pg_gin"},
-    query_type = {"Lookup to benchmark: member, attr1, and2, and2_attr, " ..
-                  "with_range, range_only, join or join_attr1", "member"},
+    query_type = {"Workload to benchmark: the lookups member, attr1, and2, " ..
+                  "and2_attr, with_range, range_only, join or join_attr1, " ..
+                  "or the writes insert, update_array or write_heavy",
+                  "member"},
     data_set = {"Data to load and query: uniform (1-2 tags per row, " ..
                 "uniform over table_size values) or skewed (1-5 tags per " ..
                 "row, Pareto over --skewed-values values, skew set by " ..
@@ -15,7 +17,13 @@ sysbench.cmdline.options = {
                  "range_only, in percent of the rows", 1},
     join_values = {"Number of tags joined per query in join and join_attr1", 10},
     join_groups = {"Number of tag groups to pick from in join and join_attr1", 1000},
-    verify_count = {"Number of queries run by the verify command", 100}
+    verify_count = {"Number of queries run by the verify command", 100},
+    array_index = {"prepare: create the array index (on), or not (off: the " ..
+                   "control of the write workloads)", "on"},
+    gin_fastupdate = {"PostgreSQL: fastupdate of the GIN index (on or off)", "on"},
+    settle = {"prepare: end with the settle command (on or off)", "on"},
+    index_name = {"drop_index and create_index: the array index (array) " ..
+                  "or the B-tree on attr1 (attr1)", "array"}
 }
 
 -- Map the standard Sysbench commands to our custom Lua functions
@@ -38,6 +46,22 @@ sysbench.cmdline.commands = {
     -- instances of the lookup, to compare results between servers.
     verify = {
         function() cmd_verify() end,
+        sysbench.cmdline.DESC_DEFAULT
+    },
+    -- Bring the loaded table to a steady state (statistics, no pending
+    -- background work), as prepare does at its end unless --settle=off.
+    settle = {
+        function() cmd_settle() end,
+        sysbench.cmdline.DESC_DEFAULT
+    },
+    -- Drop or create the index named by --index-name, to time the index
+    -- build on a loaded table (W2).
+    drop_index = {
+        function() cmd_index(false) end,
+        sysbench.cmdline.DESC_DEFAULT
+    },
+    create_index = {
+        function() cmd_index(true) end,
         sysbench.cmdline.DESC_DEFAULT
     }
 }
@@ -105,6 +129,48 @@ local function json_tags(tags)
     return "[" .. table.concat(quoted, ", ") .. "]"
 end
 
+-- The values of one new row, as "(attributes, attr1, attr2, created)"
+-- strings, drawn with the data set's distribution
+local function row_values()
+    local tags = row_tags()
+    local doc = json_tags(tags)
+    if sysbench.opt.index_type ~= "mariadb_array" then
+        -- attributes is the tags array itself for mariadb_array, see
+        -- cmd_prepare()
+        doc = "{\"tags\": " .. doc .. "}"
+    end
+    local attr2 = "NULL"
+    if tags[2] then
+        attr2 = string.format("'value-%d'", tags[2])
+    end
+    return string.format("'%s'", doc), string.format("'value-%d'", tags[1]),
+           attr2, tostring(sysbench.rand.uniform(1, sysbench.opt.table_size))
+end
+
+-- DDL creating and dropping the array index of each --index-type
+local function array_index_sql(index_type)
+    if index_type == "pg_gin" then
+        local fastupdate = sysbench.opt.gin_fastupdate
+        if fastupdate ~= "on" and fastupdate ~= "off" then
+            error("--gin-fastupdate must be on or off")
+        end
+        return "CREATE INDEX idx_attributes ON mvi_benchmark " ..
+               "USING GIN ((attributes->'tags') jsonb_path_ops) " ..
+               "WITH (fastupdate = " .. fastupdate .. ")",
+               "DROP INDEX idx_attributes"
+    end
+    local def
+    if index_type == "ft_json" then
+        def = "FULLTEXT INDEX idx_attributes (attributes) WITH PARSER ft_json"
+    elseif index_type == "mariadb_array" then
+        def = "INDEX idx_attributes (CAST(attributes AS CHAR(32) ARRAY))"
+    else
+        def = "INDEX idx_attributes ((CAST(attributes->'$.tags' AS BINARY(32) ARRAY)))"
+    end
+    return "ALTER TABLE mvi_benchmark ADD " .. def,
+           "ALTER TABLE mvi_benchmark DROP INDEX idx_attributes", def
+end
+
 -- MySQL and MariaDB: wait, up to timeout seconds, until InnoDB has written
 -- out all dirty pages, by setting innodb_max_dirty_pages_pct to 0 for the
 -- duration. Otherwise the page cleaner writes out the loaded data during
@@ -135,6 +201,13 @@ function cmd_prepare()
     local con = drv:connect()
 
     local index_type = sysbench.opt.index_type
+    local with_array_index = sysbench.opt.array_index ~= "off"
+    local _, _, array_index_def = array_index_sql(index_type)
+    -- The array index clause of CREATE TABLE (MySQL, MariaDB), if any
+    local array_index_clause = ""
+    if with_array_index and array_index_def then
+        array_index_clause = array_index_def .. ","
+    end
 
     print("Creating tables mvi_benchmark and mvi_vals...")
     con:query("DROP TABLE IF EXISTS mvi_benchmark")
@@ -154,7 +227,7 @@ function cmd_prepare()
             attr1 VARCHAR(32),
             attr2 VARCHAR(32),
             created INT,
-            FULLTEXT INDEX idx_attributes (attributes) WITH PARSER ft_json,
+            %s
             INDEX idx_attr1 (attr1),
             INDEX idx_attr2 (attr2),
             INDEX idx_created (created)
@@ -168,7 +241,7 @@ function cmd_prepare()
             attr1 VARCHAR(32),
             attr2 VARCHAR(32),
             created INT,
-            INDEX idx_attributes ((CAST(attributes->'$.tags' AS BINARY(32) ARRAY))),
+            %s
             INDEX idx_attr1 (attr1),
             INDEX idx_attr2 (attr2),
             INDEX idx_created (created)
@@ -184,7 +257,7 @@ function cmd_prepare()
             attr1 VARCHAR(32),
             attr2 VARCHAR(32),
             created INT,
-            INDEX idx_attributes (CAST(attributes AS CHAR(32) ARRAY)),
+            %s
             INDEX idx_attr1 (attr1),
             INDEX idx_attr2 (attr2),
             INDEX idx_created (created)
@@ -192,9 +265,9 @@ function cmd_prepare()
     ]]
 
     if index_type == "ft_json" then
-        con:query(create_table_ft_json)
+        con:query(string.format(create_table_ft_json, array_index_clause))
     elseif index_type == "mariadb_array" then
-        con:query(create_table_mariadb_array)
+        con:query(string.format(create_table_mariadb_array, array_index_clause))
     elseif index_type == "pg_gin" then
         -- PostgreSQL: a GIN index on the tags array, the counterpart of the
         -- multi-valued index; indexes are created separately
@@ -207,13 +280,14 @@ function cmd_prepare()
                 created INT
             )
         ]])
-        con:query("CREATE INDEX idx_attributes ON mvi_benchmark " ..
-                  "USING GIN ((attributes->'tags') jsonb_path_ops)")
+        if with_array_index then
+            con:query((array_index_sql(index_type)))
+        end
         con:query("CREATE INDEX idx_attr1 ON mvi_benchmark (attr1)")
         con:query("CREATE INDEX idx_attr2 ON mvi_benchmark (attr2)")
         con:query("CREATE INDEX idx_created ON mvi_benchmark (created)")
     else
-        con:query(create_table_array)
+        con:query(string.format(create_table_array, array_index_clause))
     end
 
     -- The outer table of join and join_attr1: join_groups groups of
@@ -247,26 +321,23 @@ function cmd_prepare()
         local end_idx = math.min(i + batch_size - 1, sysbench.opt.table_size)
 
         for j = i, end_idx do
-            local tags = row_tags()
-            local doc = json_tags(tags)
-            if index_type ~= "mariadb_array" then
-                -- attributes is the tags array itself for mariadb_array,
-                -- see above
-                doc = "{\"tags\": " .. doc .. "}"
-            end
-            local attr2 = "NULL"
-            if tags[2] then
-                attr2 = string.format("'value-%d'", tags[2])
-            end
-            table.insert(values,
-                string.format("('%s', 'value-%d', %s, %d)", doc, tags[1], attr2,
-                              sysbench.rand.uniform(1, sysbench.opt.table_size)))
+            table.insert(values, "(" .. table.concat({row_values()}, ", ") .. ")")
         end
 
         query = query .. table.concat(values, ", ")
         con:query(query)
     end
-    if index_type == "pg_gin" then
+    if sysbench.opt.settle ~= "off" then
+        settle_tables(con)
+    end
+    print("Prepare phase complete.")
+    con:disconnect()
+end
+
+-- Bring the loaded tables to a steady state, so that the runs don't
+-- overlap background work left from loading
+function settle_tables(con)
+    if sysbench.opt.index_type == "pg_gin" then
         -- PostgreSQL needs statistics to choose the indexes. VACUUM also
         -- merges the GIN pending list, sets hint bits and the visibility
         -- map, and CHECKPOINT writes out the dirty pages, so that neither
@@ -281,7 +352,34 @@ function cmd_prepare()
         con:query("ANALYZE TABLE mvi_benchmark, mvi_vals")
         flush_innodb(con, 600)
     end
-    print("Prepare phase complete.")
+end
+
+function cmd_settle()
+    local drv = sysbench.sql.driver()
+    local con = drv:connect()
+    settle_tables(con)
+    con:disconnect()
+end
+
+-- Custom commands: drop or create the index named by --index-name (W2).
+-- Index creation is timed by the caller.
+function cmd_index(create)
+    local drv = sysbench.sql.driver()
+    local con = drv:connect()
+    local index_type = sysbench.opt.index_type
+    local create_sql, drop_sql
+    if sysbench.opt.index_name == "array" then
+        create_sql, drop_sql = array_index_sql(index_type)
+    elseif sysbench.opt.index_name == "attr1" then
+        create_sql = "CREATE INDEX idx_attr1 ON mvi_benchmark (attr1)"
+        drop_sql = "DROP INDEX idx_attr1"
+        if index_type ~= "pg_gin" then
+            drop_sql = drop_sql .. " ON mvi_benchmark"
+        end
+    else
+        error("--index-name must be array or attr1")
+    end
+    con:query(create and create_sql or drop_sql)
     con:disconnect()
 end
 
@@ -351,6 +449,20 @@ local array_sql = {
         join = "j.val MEMBER OF(t.attributes->'$.tags')"
     }
 }
+
+-- W3 and W4: one new row, and new tags for a random loaded row
+function insert_sql()
+    return "INSERT INTO mvi_benchmark (attributes, attr1, attr2, created) " ..
+           "VALUES (" .. table.concat({row_values()}, ", ") .. ")"
+end
+
+function update_array_sql()
+    local attributes, attr1, attr2 = row_values()
+    return string.format(
+        "UPDATE mvi_benchmark SET attributes = %s, attr1 = %s, attr2 = %s " ..
+        "WHERE id = %d", attributes, attr1, attr2,
+        sysbench.rand.uniform(1, sysbench.opt.table_size))
+end
 
 -- Available lookups, selected with --query-type. Each returns a function
 -- that draws the arguments and builds the SQL, or nil if --index-type
@@ -422,6 +534,26 @@ local query_types = {
                 "ON t.attr1 = j.val WHERE j.grp = %d",
                 sysbench.rand.uniform(1, sysbench.opt.join_groups))
         end
+    end,
+    -- W3: insert one new row, drawn like the loaded ones
+    insert = function()
+        return insert_sql
+    end,
+    -- W4: replace the tags of a random loaded row with newly drawn ones
+    update_array = function()
+        return update_array_sql
+    end,
+    -- M2: 50% member lookups, 25% inserts, 25% array updates
+    write_heavy = function(a)
+        return function()
+            local r = sysbench.rand.uniform(1, 4)
+            if r <= 2 then
+                return "SELECT id FROM mvi_benchmark WHERE " .. a.member(data_tag())
+            elseif r == 3 then
+                return insert_sql()
+            end
+            return update_array_sql()
+        end
     end
 }
 
@@ -441,7 +573,8 @@ local function resolve_query()
     if not make then
         error(string.format("unknown --query-type '%s' (expected: member, " ..
                             "attr1, and2, and2_attr, with_range, range_only, " ..
-                            "join, join_attr1)", query_type))
+                            "join, join_attr1, insert, update_array, " ..
+                            "write_heavy)", query_type))
     end
     local builder = make(a)
     if not builder then
