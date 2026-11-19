@@ -313,6 +313,18 @@ index (H12). R9 is a correctness check and has none. M1-M3 use the controls
 of R1, W3 and W4, with the same mix run on the table without the array
 index.
 
+TODO: make the controls return as many rows as their workloads. On the
+`skewed` data set, `and2_attr` (`attr1 = a AND attr2 = b`) matches about
+10 times fewer rows than `and2`, and `join_attr1` about 3 times fewer than
+`join`, because `attr1` and `attr2` hold only the first two tags while the
+array lookups match a tag in any position (first `p1` run, `.verify`
+totals). The ratio of a workload to its control then partly measures
+result size rather than the index. Replace them with a tag table with a
+B-tree, `(tag, id)` with one row per tag of each row: the usual
+relational alternative to an array index, matching exactly the rows the
+array lookups match. The comparison between servers isn't affected,
+since both return the same rows.
+
 ## Space
 
 After W1, after W4 for 10% of rows, and after M3:
@@ -381,5 +393,7 @@ ids matched by a fixed set of queries. Remaining:
 - `pg_array` as another `--index-type`, and `--index-type=none` for the
   table without the array index (Baselines).
 - A control query type for each remaining read workload (Baselines).
+- Controls that match the same rows as their workloads, through a tag
+  table (TODO in Baselines).
 - Repeating each run and reporting the median, with 60-120 s runs (Systems
   and setup); `run-mvi-benchmark.sh` does one 30 s run per query type.
